@@ -1,11 +1,7 @@
 import torch
 import matplotlib.pyplot as plt
 import numpy as np
-from mpl_toolkits.mplot3d import Axes3D
-import math
-import scipy
 import scipy.io
-import cmath
 import time
 from scipy import interpolate
 from SteeringPhases import SteeringPhasesPA8
@@ -136,7 +132,7 @@ Z0 = rho0 * c0
 for n in range(nmax):
     att_modl = torch.mul(a[:,:,n],1e2*fMHz)
     rho_modl = rho[:,:,n]
-    b = torch.mul(2*math.pi *f,torch.reciprocal(c[:,:,n]))
+    b = torch.mul(2*torch.pi *f,torch.reciprocal(c[:,:,n]))
     Z[:,:,n] = torch.mul(torch.complex(torch.ones(b.shape,device='cuda'), - att_modl/b) ,torch.mul(rho[:,:,n],c[:,:,n]))
     if n==0:
         
@@ -169,7 +165,7 @@ for n in range(nmax):
     Asum = torch.sum(Aabs)
     rpave = torch.div(torch.sum(torch.sum(rp * Aabs)),Asum)
     rpave = rpave.real
-    bvect = torch.mul(2 * math.pi * f,torch.reciprocal( c[:,:,n]))
+    bvect = torch.mul(2 * torch.pi * f,torch.reciprocal( c[:,:,n]))
     avect = a[:,:,n] * 1e-4 * f
     avect=avect.real
     dbvect = torch.sub(bvect ,bprime[n])
