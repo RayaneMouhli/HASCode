@@ -1,10 +1,12 @@
 import torch
+import torch.nn as nn
 import matplotlib.pyplot as plt
 import numpy as np
 import scipy.io
 import time
 from scipy import interpolate
 from SteeringPhases import SteeringPhasesPA8
+from torchdiffeq import odeint_adjoint as odeint
 
 """
 References: https://ieeexplore.ieee.org/document/6217558
@@ -66,6 +68,108 @@ these are the fields loaded with the erfa .mat file:
 
   
 """
+
+class ODEFunc(nn.Module):
+    def __init__(self, fMHz, j, lx, ly, pp, A0, Z0, cuda, nmax, c, pfor, b_prime, dz):
+        # super(ODEFunc, self).__init__()
+        self.fMHz = fMHz
+        # self.A = A
+        self.Z = Z
+        self.A0 = A0
+        self.Z0 = Z0
+        self.pp = pp
+        self.mmax = mmax
+        self.lx = lx
+        self.ly = ly
+        self.j = j
+        self.a = a
+        self.rho = rho
+        self.f = fMHz * 1e6
+        self.cuda = cuda
+        self.nmax = nmax
+        self.c = c
+        self.pfor = pfor
+        self.b_prime = b_prime
+        self.dz = dz
+
+    def forward(self):
+        for n in range(self.nmax):
+            att_modl = torch.mul(self.a[:, :, n], 1e2 * self.fMHz)
+            # rho_modl = rho[:, :, n]
+            # phase change: b_n(x,y)=2*\pi*f/c_n(x,y), Eq.(3)
+            b = torch.mul(2 * torch.pi * self.f, torch.reciprocal(self.c[:, :, n]))
+            self.Z[:, :, n] = torch.mul(
+                torch.complex(torch.ones(b.shape, device="cuda"), -att_modl / b),
+                torch.mul(self.rho[:, :, n], c[:, :, n]),
+            )
+            if n == 0:
+                Refl = torch.div(torch.sub(self.Z[:, :, 0], self.Z0), torch.add(self.Z[:, :, 0], self.Z0))
+                pforb = torch.mul(self.pp, torch.add(1, Refl))
+            else:
+                Refl = torch.div(
+                    torch.sub(self.Z[:, :, n], self.Z[:, :, n - 1]), torch.add(self.Z[:, :, n], self.Z[:, :, n - 1])
+                )
+                pref[:, :, n - 1] = torch.mul(Refl, self.pfor[:, :, n - 1])
+                pforb = torch.mul(self.pfor[:, :, n - 1], torch.add(1, Refl))
+
+            self.b_prime[n] = torch.sum(torch.mul(torch.abs(pforb), b)) / torch.sum(torch.abs(pforb))
+            self.b_prime = self.b_prime.real
+            alpha = torch.mul(
+                torch.arange(1, self.mmax + 1, device="cuda")
+                - torch.ceil(torch.Tensor([self.mmax / 2]).to(self.cuda)),
+                torch.mul(2 * np.pi / self.lx, torch.reciprocal(self.b_prime[n])),
+            )
+            beta = torch.mul(
+                torch.arange(1, self.lmax + 1, device="cuda")
+                - torch.ceil(torch.Tensor([self.lmax / 2]).to(self.cuda)),
+                torch.mul(2 * np.pi / self.ly, torch.reciprocal(self.b_prime[n])),
+            )
+            alpha = alpha.real
+            beta = beta.real
+            alpha_sq, beta_sq = torch.meshgrid(
+                torch.pow(alpha, 2), torch.pow(beta, 2), indexing="xy"
+            )
+
+            expon = torch.sub(1, torch.add(alpha_sq, beta_sq))
+            rp = self.dz * torch.sqrt(expon.to(torch.complex64))
+            complex_idx = torch.imag(rp) > 0
+            rp[complex_idx] = 0
+
+            if n == 0 or torch.sum(torch.sum(torch.abs(A))):
+                Aabs = torch.abs(self.A0)
+            else:
+                Aabs = torch.abs(A)
+            Aabs[Aabs < 0.5 * torch.max(Aabs)] = 0
+            Asum = torch.sum(Aabs)
+            rpave = torch.div(torch.sum(torch.sum(rp * Aabs)), Asum)
+            rpave = rpave.real
+            b_vect = torch.mul(2 * torch.pi * self.f, torch.reciprocal(c[:, :, n]))
+            a_vect = self.a[:, :, n] * 1e-4 * self.f
+            a_vect = a_vect.real
+            dbvect = torch.sub(b_vect, self.b_prime[n])
+            dbvect = dbvect.real
+
+            pprimeterm = torch.mul(
+                torch.exp(torch.mul(dbvect, torch.mul(rpave, self.j))),
+                torch.exp(torch.mul(-a_vect, rpave)),
+            )
+
+            # Eq. (7)
+            p_prime = torch.mul(pforb, pprimeterm)
+            # Eq. (9)
+            A = torch.mul(
+                torch.fft.fftshift(torch.fft.fft2(p_prime)),
+                torch.exp(
+                    torch.mul(
+                        self.b_prime[n] * self.dz, torch.mul(torch.sqrt(expon.to(torch.complex128)), self.j)
+                    )
+                ),
+            )
+
+            pmat = torch.fft.ifft2(torch.fft.ifftshift(A))
+            self.pfor[:, :, n] = pmat    
+
+        return self.pfor
 
 cuda = torch.device("cuda:1")
 torch.cuda.set_device(1)
@@ -227,82 +331,11 @@ A0 = torch.fft.fftshift(torch.fft.fft2(pp))
 Z0 = rho0 * c0
 
 
-for n in range(nmax):
-    att_modl = torch.mul(a[:, :, n], 1e2 * fMHz)
-    # rho_modl = rho[:, :, n]
-    # phase change: b_n(x,y)=2*\pi*f/c_n(x,y), Eq.(3)
-    b = torch.mul(2 * torch.pi * f, torch.reciprocal(c[:, :, n]))
-    Z[:, :, n] = torch.mul(
-        torch.complex(torch.ones(b.shape, device="cuda"), -att_modl / b),
-        torch.mul(rho[:, :, n], c[:, :, n]),
-    )
-    if n == 0:
-        Refl = torch.div(torch.sub(Z[:, :, 0], Z0), torch.add(Z[:, :, 0], Z0))
-        pforb = torch.mul(pp, torch.add(1, Refl))
-    else:
-        Refl = torch.div(
-            torch.sub(Z[:, :, n], Z[:, :, n - 1]), torch.add(Z[:, :, n], Z[:, :, n - 1])
-        )
-        pref[:, :, n - 1] = torch.mul(Refl, pfor[:, :, n - 1])
-        pforb = torch.mul(pfor[:, :, n - 1], torch.add(1, Refl))
+func = ODEFunc(fMHz, j, lx, ly, pp, A0, Z0, cuda, nmax, c, pfor, b_prime, dz).to(cuda)
+pred_y = odeint(func, true_y0, nmax)
 
-    b_prime[n] = torch.sum(torch.mul(torch.abs(pforb), b)) / torch.sum(torch.abs(pforb))
-    b_prime = b_prime.real
-    alpha = torch.mul(
-        torch.arange(1, mmax + 1, device="cuda")
-        - torch.ceil(torch.Tensor([mmax / 2]).to(cuda)),
-        torch.mul(2 * np.pi / lx, torch.reciprocal(b_prime[n])),
-    )
-    beta = torch.mul(
-        torch.arange(1, lmax + 1, device="cuda")
-        - torch.ceil(torch.Tensor([lmax / 2]).to(cuda)),
-        torch.mul(2 * np.pi / ly, torch.reciprocal(b_prime[n])),
-    )
-    alpha = alpha.real
-    beta = beta.real
-    alpha_sq, beta_sq = torch.meshgrid(
-        torch.pow(alpha, 2), torch.pow(beta, 2), indexing="xy"
-    )
-
-    expon = torch.sub(1, torch.add(alpha_sq, beta_sq))
-    rp = dz * torch.sqrt(expon.to(torch.complex64))
-    complex_idx = torch.imag(rp) > 0
-    rp[complex_idx] = 0
-
-    if n == 0 or torch.sum(torch.sum(torch.abs(A))):
-        Aabs = torch.abs(A0)
-    else:
-        Aabs = torch.abs(A)
-    Aabs[Aabs < 0.5 * torch.max(Aabs)] = 0
-    Asum = torch.sum(Aabs)
-    rpave = torch.div(torch.sum(torch.sum(rp * Aabs)), Asum)
-    rpave = rpave.real
-    b_vect = torch.mul(2 * torch.pi * f, torch.reciprocal(c[:, :, n]))
-    a_vect = a[:, :, n] * 1e-4 * f
-    a_vect = a_vect.real
-    dbvect = torch.sub(b_vect, b_prime[n])
-    dbvect = dbvect.real
-
-    pprimeterm = torch.mul(
-        torch.exp(torch.mul(dbvect, torch.mul(rpave, j))),
-        torch.exp(torch.mul(-a_vect, rpave)),
-    )
-
-    # Eq. (7)
-    p_prime = torch.mul(pforb, pprimeterm)
-    # Eq. (9)
-    A = torch.mul(
-        torch.fft.fftshift(torch.fft.fft2(p_prime)),
-        torch.exp(
-            torch.mul(
-                b_prime[n] * dz, torch.mul(torch.sqrt(expon.to(torch.complex128)), j)
-            )
-        ),
-    )
-
-    pmat = torch.fft.ifft2(torch.fft.ifftshift(A))
-    pfor[:, :, n] = pmat
 
 print("The time difference is ", time.time() - start, "seconds")
 
-torch.save(pfor, f'Output/pout_pyth_P6.pt')
+# scipy.io.savemat('Output/pout_pyth.mat',{'pout_pyth':pfor.cpu().numpy()})
+scipy.io.savemat("Output/pout_pyth_P6.mat", {"pout_pyth": pfor.cpu().numpy()})

@@ -66,6 +66,78 @@ these are the fields loaded with the erfa .mat file:
 
   
 """
+def propagate_pressure(pfor_list_n_prev, Z_list_n_prev, A, A0, n, a_list_n, rho_list_n, c_list_n, fMHz, f, mmax, lmax, device, lx, ly, dz, j):
+    att_modl = torch.mul(a_list_n, 1e2 * fMHz)
+    # rho_modl = rho_list_n
+    # phase change: b_n(x,y)=2*\pi*f/c_n(x,y), Eq.(3)
+    b = torch.mul(2 * torch.pi * f, torch.reciprocal(c_list_n))
+    Z_list_n = torch.mul(
+        torch.complex(torch.ones(b.shape, device="cuda"), -att_modl / b),
+        torch.mul(rho_list_n, c_list_n),
+    )
+    Refl = torch.div(
+        torch.sub(Z_list_n, Z_list_n_prev), torch.add(Z_list_n, Z_list_n_prev)
+    )
+    pforb = torch.mul(pfor_list_n_prev, torch.add(1, Refl))
+
+    b_prime_n = torch.sum(torch.mul(torch.abs(pforb), b)) / torch.sum(torch.abs(pforb))
+    b_prime_n = b_prime_n.real
+    alpha = torch.mul(
+        torch.arange(1, mmax + 1, device="cuda")
+        - torch.ceil(torch.Tensor([mmax / 2]).to(device)),
+        torch.mul(2 * np.pi / lx, torch.reciprocal(b_prime_n)),
+    )
+    beta = torch.mul(
+        torch.arange(1, lmax + 1, device="cuda")
+        - torch.ceil(torch.Tensor([lmax / 2]).to(device)),
+        torch.mul(2 * np.pi / ly, torch.reciprocal(b_prime_n)),
+    )
+    alpha = alpha.real
+    beta = beta.real
+    alpha_sq, beta_sq = torch.meshgrid(
+        torch.pow(alpha, 2), torch.pow(beta, 2), indexing="xy"
+    )
+
+    expon = torch.sub(1, torch.add(alpha_sq, beta_sq))
+    rp = dz * torch.sqrt(expon.to(torch.complex64))
+    complex_idx = torch.imag(rp) > 0
+    rp[complex_idx] = 0
+
+    if n == 0 or torch.sum(torch.sum(torch.abs(A))):
+        Aabs = torch.abs(A0)
+    else:
+        Aabs = torch.abs(A)
+    Aabs[Aabs < 0.5 * torch.max(Aabs)] = 0
+    Asum = torch.sum(Aabs)
+    rpave = torch.div(torch.sum(torch.sum(rp * Aabs)), Asum)
+    rpave = rpave.real
+    b_vect = torch.mul(2 * torch.pi * f, torch.reciprocal(c_list_n))
+    a_vect = a_list_n * 1e-4 * f
+    a_vect = a_vect.real
+    dbvect = torch.sub(b_vect, b_prime_n)
+    dbvect = dbvect.real
+
+    pprimeterm = torch.mul(
+        torch.exp(torch.mul(dbvect, torch.mul(rpave, j))),
+        torch.exp(torch.mul(-a_vect, rpave)),
+    )
+
+    # Eq. (7)
+    p_prime = torch.mul(pforb, pprimeterm)
+    # Eq. (9)
+    A = torch.mul(
+        torch.fft.fftshift(torch.fft.fft2(p_prime)),
+        torch.exp(
+            torch.mul(
+                b_prime_n * dz, torch.mul(torch.sqrt(expon.to(torch.complex128)), j)
+            )
+        ),
+    )
+
+    pmat = torch.fft.ifft2(torch.fft.ifftshift(A))
+    pfor_list_n = pmat
+    
+    return pfor_list_n, Z_list_n, A
 
 cuda = torch.device("cuda:1")
 torch.cuda.set_device(1)
@@ -228,80 +300,32 @@ Z0 = rho0 * c0
 
 
 for n in range(nmax):
-    att_modl = torch.mul(a[:, :, n], 1e2 * fMHz)
-    # rho_modl = rho[:, :, n]
-    # phase change: b_n(x,y)=2*\pi*f/c_n(x,y), Eq.(3)
-    b = torch.mul(2 * torch.pi * f, torch.reciprocal(c[:, :, n]))
-    Z[:, :, n] = torch.mul(
-        torch.complex(torch.ones(b.shape, device="cuda"), -att_modl / b),
-        torch.mul(rho[:, :, n], c[:, :, n]),
-    )
-    if n == 0:
-        Refl = torch.div(torch.sub(Z[:, :, 0], Z0), torch.add(Z[:, :, 0], Z0))
-        pforb = torch.mul(pp, torch.add(1, Refl))
+    if n==0:
+        pfor_list_n_prev = pp
+        Z_list_n_prev = Z0
+        A = A0
     else:
-        Refl = torch.div(
-            torch.sub(Z[:, :, n], Z[:, :, n - 1]), torch.add(Z[:, :, n], Z[:, :, n - 1])
-        )
-        pref[:, :, n - 1] = torch.mul(Refl, pfor[:, :, n - 1])
-        pforb = torch.mul(pfor[:, :, n - 1], torch.add(1, Refl))
+        pfor_list_n_prev = pfor[..., n-1]
+        Z_list_n_prev = Z[..., n-1]
+        A = A
 
-    b_prime[n] = torch.sum(torch.mul(torch.abs(pforb), b)) / torch.sum(torch.abs(pforb))
-    b_prime = b_prime.real
-    alpha = torch.mul(
-        torch.arange(1, mmax + 1, device="cuda")
-        - torch.ceil(torch.Tensor([mmax / 2]).to(cuda)),
-        torch.mul(2 * np.pi / lx, torch.reciprocal(b_prime[n])),
-    )
-    beta = torch.mul(
-        torch.arange(1, lmax + 1, device="cuda")
-        - torch.ceil(torch.Tensor([lmax / 2]).to(cuda)),
-        torch.mul(2 * np.pi / ly, torch.reciprocal(b_prime[n])),
-    )
-    alpha = alpha.real
-    beta = beta.real
-    alpha_sq, beta_sq = torch.meshgrid(
-        torch.pow(alpha, 2), torch.pow(beta, 2), indexing="xy"
-    )
-
-    expon = torch.sub(1, torch.add(alpha_sq, beta_sq))
-    rp = dz * torch.sqrt(expon.to(torch.complex64))
-    complex_idx = torch.imag(rp) > 0
-    rp[complex_idx] = 0
-
-    if n == 0 or torch.sum(torch.sum(torch.abs(A))):
-        Aabs = torch.abs(A0)
-    else:
-        Aabs = torch.abs(A)
-    Aabs[Aabs < 0.5 * torch.max(Aabs)] = 0
-    Asum = torch.sum(Aabs)
-    rpave = torch.div(torch.sum(torch.sum(rp * Aabs)), Asum)
-    rpave = rpave.real
-    b_vect = torch.mul(2 * torch.pi * f, torch.reciprocal(c[:, :, n]))
-    a_vect = a[:, :, n] * 1e-4 * f
-    a_vect = a_vect.real
-    dbvect = torch.sub(b_vect, b_prime[n])
-    dbvect = dbvect.real
-
-    pprimeterm = torch.mul(
-        torch.exp(torch.mul(dbvect, torch.mul(rpave, j))),
-        torch.exp(torch.mul(-a_vect, rpave)),
-    )
-
-    # Eq. (7)
-    p_prime = torch.mul(pforb, pprimeterm)
-    # Eq. (9)
-    A = torch.mul(
-        torch.fft.fftshift(torch.fft.fft2(p_prime)),
-        torch.exp(
-            torch.mul(
-                b_prime[n] * dz, torch.mul(torch.sqrt(expon.to(torch.complex128)), j)
-            )
-        ),
-    )
-
-    pmat = torch.fft.ifft2(torch.fft.ifftshift(A))
-    pfor[:, :, n] = pmat
+    pfor[..., n], Z[..., n], A = propagate_pressure(pfor_list_n_prev=pfor_list_n_prev, 
+                                                    Z_list_n_prev=Z_list_n_prev, 
+                                                    A=A,
+                                                    A0=A0,
+                                                    n=n,
+                                                    a_list_n=a[..., n], # starting from here, all the args below are preset or constant
+                                                    rho_list_n=rho[..., n], 
+                                                    c_list_n=c[..., n], 
+                                                    fMHz=fMHz, 
+                                                    f=f, 
+                                                    mmax=mmax, 
+                                                    lmax=lmax, 
+                                                    device=cuda, 
+                                                    lx=lx, 
+                                                    ly=ly, 
+                                                    dz=dz, 
+                                                    j=j)
 
 print("The time difference is ", time.time() - start, "seconds")
 
